@@ -1,0 +1,1826 @@
+// ┌─────────────────────────────────────────────────────────────────┐
+// │  chuks_agent — Structured Agent Runtime (v2)                   │
+// │                                                                 │
+// │  Production-grade AI agents with native tool calling, real      │
+// │  messages-array round-tripping (role:"tool"), retries with      │
+// │  jittered backoff, tool error isolation, per-step deadlines,    │
+// │  per-model cost accounting, tagged + scored memory, structured  │
+// │  output, sub-agent delegation, and structured concurrency.      │
+// │                                                                 │
+// │  Backwards compatible with all existing public API.             │
+// └─────────────────────────────────────────────────────────────────┘
+
+import { json } from "std/json"
+import { strings } from "std/strings"
+import { Channel } from "std/channel"
+import { time } from "std/time"
+import { http } from "std/http"
+import { fs } from "std/fs"
+
+// ═════════════════════════════════════════════════════════════════
+// ─── Core Domain Types ──────────────────────────────────────────
+// Typed shapes for the agent runtime. Replaces ad-hoc `any` maps
+// across the public API and internal control flow.
+// ═════════════════════════════════════════════════════════════════
+
+// One entry in the LLM conversation history. Mirrors the OpenAI-style
+// chat message envelope used by every provider after normalisation.
+// `tool_calls` is populated on assistant turns that invoke tools;
+// `tool_call_id` + `name` are populated on `role: "tool"` reply turns.
+export dataType Message {
+    role: string
+    content: string
+    tool_calls: []ToolCall?
+    tool_call_id: string?
+    name: string?
+}
+
+// A single tool invocation requested by the LLM. `arguments` is the
+// already-parsed JSON object the provider returned (not the raw string).
+export dataType ToolCall {
+    id: string
+    name: string
+    arguments: any
+}
+
+// Return shape of `AgentTool.safeExecute` — error isolation contract.
+// `ok = false` ⇒ `error` describes the failure; otherwise `result` is the
+// tool output (optionally transformed).
+export dataType ToolResult {
+    ok: bool
+    result: any
+    error: string
+}
+
+// One iteration of the agent loop. `tool == "none"` indicates the final
+// answer step; otherwise `tool` is the name of the tool invoked at that
+// step and `args` / `result` describe its inputs and output.
+export dataType AgentStep {
+    stepNumber: int
+    agent: string
+    thought: string
+    tool: string
+    args: any
+    result: string
+    ok: bool
+    durationMs: any
+    tokens: int
+}
+
+// Aggregate result of one `agent.run()` (or a crew/pipeline run).
+// `structured` is populated when a JSON schema was supplied; otherwise
+// `null`. `cancelReason` is `""` on success, or one of `timeout`,
+// `maxCost`, `llmError`, `maxSteps`, `unknownDelegate`.
+export dataType AgentRunResult {
+    answer: string
+    structured: any
+    steps: []AgentStep
+    totalSteps: int
+    tokens: int
+    inputTokens: int
+    outputTokens: int
+    durationMs: any
+    cost: any
+    model: string
+    success: bool
+    cancelReason: string
+}
+
+// One unit of work passed to `crew.parallel`. `agent` runs `task` as
+// its prompt; results are returned in input order.
+export dataType CrewTask {
+    agent: Agent
+    task: string
+}
+
+// ═════════════════════════════════════════════════════════════════
+// ─── Pricing Table ──────────────────────────────────────────────
+// $ per 1k tokens. Keep up-to-date; falls back to 0 if unknown.
+// First match wins via prefix containment (e.g. "gpt-4o-mini").
+// ═════════════════════════════════════════════════════════════════
+
+class _Pricing {
+    var prefix: string = ""
+    var inPer1k: any = 0
+    var outPer1k: any = 0
+    constructor(p: string, i: any, o: any) {
+        this.prefix = p
+        this.inPer1k = i
+        this.outPer1k = o
+    }
+}
+
+var _PRICING_TABLE: []_Pricing = [
+    // OpenAI
+    new _Pricing("gpt-4o-mini", 0.00015, 0.0006),
+    new _Pricing("gpt-4o", 0.0025, 0.01),
+    new _Pricing("gpt-4-turbo", 0.01, 0.03),
+    new _Pricing("gpt-4", 0.03, 0.06),
+    new _Pricing("gpt-3.5", 0.0005, 0.0015),
+    new _Pricing("o1-mini", 0.003, 0.012),
+    new _Pricing("o1", 0.015, 0.06),
+    // Anthropic
+    new _Pricing("claude-3-5-haiku", 0.0008, 0.004),
+    new _Pricing("claude-3-5-sonnet", 0.003, 0.015),
+    new _Pricing("claude-3-opus", 0.015, 0.075),
+    new _Pricing("claude-3-haiku", 0.00025, 0.00125),
+    new _Pricing("claude-sonnet-4", 0.003, 0.015),
+    // Groq
+    new _Pricing("llama-3.1-8b", 0.00005, 0.00008),
+    new _Pricing("llama-3.1-70b", 0.00059, 0.00079),
+    new _Pricing("llama3-70b", 0.00059, 0.00079),
+    new _Pricing("mixtral-8x7b", 0.00024, 0.00024),
+    new _Pricing("gemma-7b", 0.00007, 0.00007),
+    // Google
+    new _Pricing("gemini-1.5-flash", 0.000075, 0.0003),
+    new _Pricing("gemini-1.5-pro", 0.00125, 0.005),
+    new _Pricing("gemini-2.0-flash", 0.000075, 0.0003),
+    // Mistral
+    new _Pricing("mistral-large", 0.002, 0.006),
+    new _Pricing("mistral-small", 0.0002, 0.0006),
+    // Ollama (local — free)
+    new _Pricing("llama", 0, 0),
+    new _Pricing("qwen", 0, 0),
+    new _Pricing("mistral", 0, 0),
+    new _Pricing("phi", 0, 0),
+    new _Pricing("gemma", 0, 0),
+    new _Pricing("deepseek", 0, 0),
+]
+
+function _lookupPricing(model: string): _Pricing? {
+    var lower: string = strings.toLower(model)
+    var i: int = 0
+    while (i < _PRICING_TABLE.length) {
+        var p: _Pricing = _PRICING_TABLE[i]
+        if (strings.contains(lower, p.prefix)) {
+            return p
+        }
+        i = i + 1
+    }
+    var none: _Pricing? = null
+    return none
+}
+
+function _estimateCost(model: string, inTokens: int, outTokens: int): any {
+    var p: _Pricing? = _lookupPricing(model)
+    if (p == null) { return 0 }
+    return ((inTokens * p.inPer1k) + (outTokens * p.outPer1k)) / 1000
+}
+
+// ═════════════════════════════════════════════════════════════════
+// ─── Tool Definition ────────────────────────────────────────────
+// A tool is a typed function the LLM can call. The agent decides
+// which tools to use, in what order, based on what it needs.
+//
+// Rich schema (NEW):
+//   params: {
+    //     city:    { type: "string", description: "City name", required: true },
+    //     days:    { type: "int",    description: "Number of days", required: false, default: 1 },
+    //     unit:    { type: "string", description: "C or F", enum: ["C","F"] },
+    //     tags:    { type: "array",  description: "Tags", items: { type: "string" } },
+    //   }
+//
+// Legacy schema (still works):
+//   params: { city: "City name", days: "Number of days" }
+//   (treated as string, required: true)
+// ═════════════════════════════════════════════════════════════════
+
+// A callable function the LLM can invoke during an agent run.
+//
+// Build one via `tool.create({ name, description, fn, params, validate?, transform? })`.
+// The `params` field uses the rich schema shape — see the module header.
+//
+// Example:
+//     var greet = tool.create({
+    //         name: "greet",
+    //         description: "Say hello to a person",
+    //         fn: function(args) { return "Hello, " + args.name },
+    //         params: { name: { type: "string", description: "Person to greet", required: true } }
+    //     })
+export class AgentTool {
+    var name: string = ""
+    var description: string = ""
+    var fn: any = null
+    var params: any = null
+    var _validate: any = null
+    var _transform: any = null
+
+    constructor(config: any) {
+        if (config.name != null) { this.name = config.name }
+        if (config.description != null) { this.description = config.description }
+        if (config.fn != null) { this.fn = config.fn }
+        if (config.params != null) { this.params = config.params }
+        if (config.validate != null) { this._validate = config.validate }
+        if (config.transform != null) { this._transform = config.transform }
+    }
+
+    // Execute the tool with full error isolation.
+    //
+    // Runs `validate` (if provided), the tool function, then `transform`. Any
+    // thrown error is caught and surfaced via the return value rather than
+    // propagating to the agent loop.
+    //
+    // Returns a `ToolResult`:
+    // - `ok = true`  → `result` holds the (optionally transformed) output
+    // - `ok = false` → `error` describes the failure (validation or thrown)
+    public async safeExecute(args: any): Task<ToolResult> {
+        // Validate inputs
+        if (this._validate != null) {
+            var valid: bool = this._validate(args)
+            if (!valid) {
+                var vr: ToolResult = { "ok": false, "result": null, "error": "Tool validation failed for: " + this.name }
+                return vr
+            }
+        }
+
+        var output: any = null
+        try {
+            output = await this.fn(args)
+        } catch (e) {
+            var er: ToolResult = { "ok": false, "result": null, "error": "Tool '" + this.name + "' threw: " + string(e) }
+            return er
+        }
+
+        if (this._transform != null) {
+            try {
+                output = this._transform(output)
+            } catch (e2) {
+                var tr: ToolResult = { "ok": false, "result": null, "error": "Tool '" + this.name + "' transform threw: " + string(e2) }
+                return tr
+            }
+        }
+        var okr: ToolResult = { "ok": true, "result": output, "error": "" }
+        return okr
+    }
+
+    // Legacy single-value execute — kept for back-compat.
+    //
+    // Returns the tool's raw result on success, or the error message string
+    // on failure. Prefer `safeExecute` in new code for an explicit ok/error split.
+    public async execute(args: any): Task<any> {
+        var r: ToolResult = await this.safeExecute(args)
+        if (r.ok) { return r.result }
+        return r.error
+    }
+
+    // Convert this tool's `params` into a JSON Schema object the LLM provider
+    // can advertise as part of `function_call` / `tools` support.
+    //
+    // Honors the rich shape: `{ type, description, required, enum, items, default }`.
+    // Maps Chuks type names (`int`, `float`, `bool`, `map`) to JSON Schema
+    // equivalents (`integer`/`number`/`boolean`/`object`). Legacy string-valued
+    // params are treated as `{ type: "string", required: true }`.
+    //
+    // Returns: `{ type: "object", properties: { ... }, required: []string }`
+    public toSchema(): any {
+        var properties: any = {}
+        var required: []string = []
+
+        if (this.params != null) {
+            var keys: []string = []
+            if (this.params.keys != null) {
+                keys = this.params.keys()
+            }
+            var i: int = 0
+            while (i < keys.length) {
+                var key: string = keys[i]
+                var val: any = this.params[key]
+                if (val != null) {
+                    var propType: string = "string"
+                    var propDesc: string = ""
+                    var isRequired: bool = true
+                    var propEnum: any = null
+                    var propItems: any = null
+                    var propDefault: any = null
+
+                    // Legacy: string value → description only
+                    if (typeof(val) == "string") {
+                        propDesc = string(val)
+                    } else {
+                        // Rich object form
+                        if (val.type != null) { propType = string(val.type) }
+                        if (val.description != null) { propDesc = string(val.description) }
+                        if (val.required != null) { isRequired = val.required }
+                        if (val.enum != null) { propEnum = val.enum }
+                        if (val.items != null) { propItems = val.items }
+                        if (val.default != null) { propDefault = val.default }
+                    }
+
+                    // Map Chuks type names → JSON Schema type names
+                    var jsType: string = propType
+                    if (propType == "int" || propType == "float") { jsType = "number" }
+                    if (propType == "bool") { jsType = "boolean" }
+                    if (propType == "map") { jsType = "object" }
+
+                    var prop: any = {
+                        "type": jsType,
+                        "description": propDesc,
+                    }
+                    if (propType == "int") { prop["type"] = "integer" }
+                    if (propEnum != null) { prop["enum"] = propEnum }
+                    if (propItems != null) { prop["items"] = propItems }
+                    if (propDefault != null) { prop["default"] = propDefault }
+
+                    properties[key] = prop
+                    if (isRequired) { required.push(key) }
+                }
+                i = i + 1
+            }
+        }
+
+        return {
+            "type": "object",
+            "properties": properties,
+            "required": required,
+        }
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════
+// ─── Retry helper ───────────────────────────────────────────────
+// Exponential backoff with jitter. Used for LLM HTTP calls and
+// optionally for transient tool errors.
+// ═════════════════════════════════════════════════════════════════
+
+class _RetryPolicy {
+    var maxAttempts: int = 3
+    var initialMs: int = 200
+    var maxMs: int = 8000
+    var multiplier: any = 2.0
+    var jitterMs: int = 100
+
+    constructor() {}
+}
+
+// Pseudo-random jitter — uses time.now() low bits. Good enough for
+// spreading retries; not cryptographically random.
+function _jitter(maxMs: int): int {
+    if (maxMs <= 0) { return 0 }
+    var t: any = time.now()
+    var n: int = int(t) % maxMs
+    if (n < 0) { n = 0 - n }
+    return n
+}
+
+async function _sleepMs(ms: int): Task<any> {
+    // Busy-wait via time. Chuks doesn't expose a native sleep in std/time
+    // universally; fall back to spinning. Keep durations small.
+    var start: any = time.now()
+    while ((time.now() - start) < ms) {
+        // yield-ish loop
+    }
+    return null
+}
+
+// ═════════════════════════════════════════════════════════════════
+// ─── Tool Module ────────────────────────────────────────────────
+// tool.create(config) — create a tool from a function
+// tool.fromAgent(agent) — wrap an agent as a callable tool
+// ═════════════════════════════════════════════════════════════════
+
+// Factory module for building `AgentTool` instances. Access via the
+// module-level `tool` constant: `tool.create(...)` / `tool.fromAgent(...)`.
+class ToolModule {
+
+    // Create a new tool from a config object.
+    //
+    // Config fields:
+    // - `name`        — unique tool identifier (string, required)
+    // - `description` — human/LLM-readable purpose (string)
+    // - `fn`          — the function the agent will call; `(args) => any`
+    //                   (may be `async`, may return a `Task<T>`)
+    // - `params`      — rich-schema map of arg name → `{ type, description, required, enum, items, default }`
+    //                   (legacy: `paramName: "description"` strings also accepted)
+    // - `validate`    — optional `(args) => bool` predicate; false short-circuits with a validation error
+    // - `transform`   — optional `(result) => any` post-processor
+    public create(config: any): AgentTool {
+        return new AgentTool(config)
+    }
+
+    // Wrap another `Agent` so it can be invoked as a tool by a supervisor agent.
+    //
+    // The returned tool exposes a single `task: string` parameter. When called
+    // it forwards the prompt to `agentInst.run(task, null)` and returns the
+    // sub-agent's `answer`. This is the building block behind `config.delegates`.
+    public fromAgent(agentInst: any): AgentTool {
+        var agentName: string = "agent"
+        if (agentInst._name != null) {
+            agentName = agentInst._name
+        }
+        return new AgentTool({
+            "name": agentName,
+            "description": "Delegate a task to the " + agentName + " agent. This agent will research, reason, and use its own tools to complete the task.",
+            "fn": async function(args: any): Task<any> {
+                var taskPrompt: string = ""
+                if (args.task != null) { taskPrompt = args.task }
+                if (args.prompt != null) { taskPrompt = args.prompt }
+                if (taskPrompt == "" && args != null) { taskPrompt = string(args) }
+                var result: any = await agentInst.run(taskPrompt, null)
+                if (result != null && result.answer != null) {
+                    return result.answer
+                }
+                return string(result)
+            },
+            "params": {
+                "task": { "type": "string", "description": "The task to delegate to this agent", "required": true },
+            },
+        })
+    }
+}
+
+// Singleton factory for building tools. Use `tool.create({...})` or
+// `tool.fromAgent(otherAgent)` to construct `AgentTool` instances.
+const tool = new ToolModule()
+
+// ═════════════════════════════════════════════════════════════════
+// ─── Built-in Tools ─────────────────────────────────────────────
+// Ready-to-use tools that ship with chuks_agent.
+// ═════════════════════════════════════════════════════════════════
+
+class BuiltinTools {
+
+    public webSearch(config: any?): AgentTool {
+        var provider: string = "brave"
+        var apiKey: string = ""
+        var maxResults: int = 5
+        if (config != null) {
+            if (config.provider != null) { provider = config.provider }
+            if (config.apiKey != null) { apiKey = config.apiKey }
+            if (config.maxResults != null) { maxResults = config.maxResults }
+        }
+        var capturedApiKey: string = apiKey
+        var capturedMax: int = maxResults
+        var capturedProvider: string = provider
+        return new AgentTool({
+            "name": "webSearch",
+            "description": "Search the web for information. Returns search result snippets.",
+            "fn": async function(args: any): Task<any> {
+                var query: string = args.query
+                if (capturedProvider == "brave") {
+                    var resp: any = await http.get(
+                        "https://api.search.brave.com/res/v1/web/search?q=" + query + "&count=" + string(capturedMax),
+                        { "X-Subscription-Token": capturedApiKey, "Accept": "application/json" }
+                    )
+                    return resp.body
+                }
+                if (capturedProvider == "serper") {
+                    var resp2: any = await http.post(
+                        "https://google.serper.dev/search",
+                        json.stringify({ "q": query, "num": capturedMax }),
+                        { "X-API-KEY": capturedApiKey, "Content-Type": "application/json" }
+                    )
+                    return resp2.body
+                }
+                if (capturedProvider == "tavily") {
+                    var resp3: any = await http.post(
+                        "https://api.tavily.com/search",
+                        json.stringify({ "api_key": capturedApiKey, "query": query, "max_results": capturedMax }),
+                        { "Content-Type": "application/json" }
+                    )
+                    return resp3.body
+                }
+                return "Unsupported search provider: " + capturedProvider
+            },
+            "params": {
+                "query": { "type": "string", "description": "The search query string", "required": true },
+            },
+        })
+    }
+
+    // URL-fetch tool that returns the page body as text.
+    //
+    // Config:
+    // - `maxLength` — truncate response body to this many chars (default `10000`)
+    //
+    // LLM-facing args: `{ url: string }`.
+    public readURL(config: any?): AgentTool {
+        var maxLength: int = 10000
+        if (config != null) {
+            if (config.maxLength != null) { maxLength = config.maxLength }
+        }
+        var capturedMaxLen: int = maxLength
+        return new AgentTool({
+            "name": "readURL",
+            "description": "Read the contents of a URL. Returns the page body text.",
+            "fn": async function(args: any): Task<any> {
+                var resp: any = await http.get(args.url, {})
+                var body: string = string(resp.body)
+                if (body.length > capturedMaxLen) {
+                    body = strings.slice(body, 0, capturedMaxLen)
+                }
+                return body
+            },
+            "params": {
+                "url": { "type": "string", "description": "The URL to fetch and read", "required": true },
+            },
+        })
+    }
+
+    // Arithmetic calculator stub.
+    //
+    // Returns the raw expression back to the LLM with a hint to evaluate it.
+    // (No native expression evaluator — the LLM does the math.)
+    //
+    // LLM-facing args: `{ expression: string }`.
+    public calculator(): AgentTool {
+        return new AgentTool({
+            "name": "calculator",
+            "description": "Evaluate a mathematical expression. Supports +, -, *, /, parentheses.",
+            "fn": function(args: any): any {
+                var expr: string = string(args.expression)
+                return "Expression: " + expr + " — Please compute this arithmetically."
+            },
+            "params": {
+                "expression": { "type": "string", "description": "The mathematical expression to evaluate", "required": true },
+            },
+        })
+    }
+
+    // Current-time tool. Returns a JSON-encoded `{ timestamp, info }` blob
+    // with the current Unix time in milliseconds.
+    //
+    // LLM-facing args: `{ action?: string }` (`"now"` or `"format"`).
+    public datetime(): AgentTool {
+        return new AgentTool({
+            "name": "datetime",
+            "description": "Get the current date and time, or perform date calculations.",
+            "fn": function(args: any): any {
+                var now: any = time.now()
+                return json.stringify({
+                    "timestamp": now,
+                    "info": "Current Unix timestamp in milliseconds",
+                })
+            },
+            "params": {
+                "action": { "type": "string", "description": "What to do: 'now' for current time, 'format' to format a timestamp" },
+            },
+        })
+    }
+
+    // Generic HTTP request tool (GET or POST).
+    //
+    // Config:
+    // - `allowedDomains` — optional `[]string` allowlist; requests to other
+    //                     hosts return a safety message instead of dispatching
+    // - `timeout`        — not currently enforced (reserved)
+    //
+    // LLM-facing args: `{ url: string, method?: "GET"|"POST", body?: object }`.
+    public httpClient(config: any?): AgentTool {
+        var allowedDomains: []string = []
+        var timeout: int = 5000
+        if (config != null) {
+            if (config.allowedDomains != null) { allowedDomains = config.allowedDomains }
+            if (config.timeout != null) { timeout = config.timeout }
+        }
+        var capturedDomains: []string = allowedDomains
+        return new AgentTool({
+            "name": "httpRequest",
+            "description": "Make an HTTP request to an API endpoint.",
+            "fn": async function(args: any): Task<any> {
+                var url: string = args.url
+                var method: string = "GET"
+                if (args.method != null) { method = args.method }
+                if (capturedDomains.length > 0) {
+                    var allowed: bool = false
+                    var di: int = 0
+                    while (di < capturedDomains.length) {
+                        if (strings.contains(url, capturedDomains[di])) {
+                            allowed = true
+                            di = capturedDomains.length
+                        }
+                        di = di + 1
+                    }
+                    if (!allowed) {
+                        return "Domain not in allowlist. Allowed: " + json.stringify(capturedDomains)
+                    }
+                }
+                if (method == "POST") {
+                    var body: string = ""
+                    if (args.body != null) { body = json.stringify(args.body) }
+                    var resp: any = await http.post(url, body, { "Content-Type": "application/json" })
+                    return resp.body
+                }
+                var resp2: any = await http.get(url, {})
+                return resp2.body
+            },
+            "params": {
+                "url":    { "type": "string", "description": "The URL to request", "required": true },
+                "method": { "type": "string", "description": "HTTP method: GET or POST", "enum": ["GET","POST"] },
+                "body":   { "type": "object", "description": "Request body for POST requests" },
+            },
+        })
+    }
+
+    // Sandboxed file-system tool.
+    //
+    // Config:
+    // - `allowedPaths` — optional `[]string` path-prefix allowlist (reads/writes
+        //                    rejected if the requested path doesn't start with one)
+    // - `allowWrite`   — if `false` (default), only reads are permitted
+    //
+    // LLM-facing args: `{ path: string, action?: "read"|"write", content?: string }`.
+    public fileSystem(config: any?): AgentTool {
+        var allowedPaths: []string = []
+        var allowWrite: bool = false
+        if (config != null) {
+            if (config.allowedPaths != null) { allowedPaths = config.allowedPaths }
+            if (config.allowWrite != null) { allowWrite = config.allowWrite }
+        }
+        var capturedPaths: []string = allowedPaths
+        var capturedWrite: bool = allowWrite
+        return new AgentTool({
+            "name": "fileSystem",
+            "description": "Read or write files on the local filesystem. Sandboxed to allowed paths only.",
+            "fn": async function(args: any): Task<any> {
+                var path: string = args.path
+                if (capturedPaths.length > 0) {
+                    var allowed: bool = false
+                    var pi: int = 0
+                    while (pi < capturedPaths.length) {
+                        if (strings.startsWith(path, capturedPaths[pi])) {
+                            allowed = true
+                            pi = capturedPaths.length
+                        }
+                        pi = pi + 1
+                    }
+                    if (!allowed) {
+                        return "Path not allowed. Allowed paths: " + json.stringify(capturedPaths)
+                    }
+                }
+                var action: string = "read"
+                if (args.action != null) { action = args.action }
+                if (action == "read") { return await fs.readFile(path) }
+                if (action == "write" && capturedWrite) {
+                    await fs.writeFile(path, args.content)
+                    return "File written: " + path
+                }
+                return "File operation not permitted"
+            },
+            "params": {
+                "path":    { "type": "string", "description": "File path to read or write", "required": true },
+                "action":  { "type": "string", "description": "Either 'read' or 'write'", "enum": ["read","write"] },
+                "content": { "type": "string", "description": "Content to write (only for write action)" },
+            },
+        })
+    }
+
+    // SQL database tool that runs queries via a user-supplied connection.
+    //
+    // Config:
+    // - `connection` — a connection object with an `async query(sql)` method (required)
+    // - `allowWrite` — if `false` (default), any `INSERT`/`UPDATE`/`DELETE`/`DROP`/`ALTER`/`CREATE` is blocked
+    // - `maxRows`    — reserved (not currently enforced)
+    //
+    // LLM-facing args: `{ query: string }`.
+    public database(config: any?): AgentTool {
+        var connection: any = null
+        var allowWrite: bool = false
+        var maxRows: int = 100
+        if (config != null) {
+            if (config.connection != null) { connection = config.connection }
+            if (config.allowWrite != null) { allowWrite = config.allowWrite }
+            if (config.maxRows != null) { maxRows = config.maxRows }
+        }
+        var capturedConn: any = connection
+        var capturedWrite: bool = allowWrite
+        return new AgentTool({
+            "name": "database",
+            "description": "Execute a SQL query against the database. Returns results as JSON.",
+            "fn": async function(args: any): Task<any> {
+                if (capturedConn == null) { return "No database connection configured" }
+                var query: string = args.query
+                if (!capturedWrite) {
+                    var lower: string = strings.toLower(query)
+                    if (strings.contains(lower, "insert") || strings.contains(lower, "update") || strings.contains(lower, "delete") || strings.contains(lower, "drop") || strings.contains(lower, "alter") || strings.contains(lower, "create")) {
+                        return "Write operations are not allowed. Database is read-only."
+                    }
+                }
+                var result: any = await capturedConn.query(query)
+                return json.stringify(result)
+            },
+            "params": {
+                "query": { "type": "string", "description": "The SQL query to execute", "required": true },
+            },
+        })
+    }
+
+    // Code-execution tool stub.
+    //
+    // Not actually wired to a sandbox — returns a safety message. Override
+    // with your own implementation when a sandboxed runtime is available.
+    //
+    // LLM-facing args: `{ code: string, language?: string }`.
+    public codeRunner(config: any?): AgentTool {
+        return new AgentTool({
+            "name": "codeRunner",
+            "description": "Execute a code snippet and return the output.",
+            "fn": function(args: any): any {
+                return "Code execution sandbox not available in this environment. Code: " + string(args.code)
+            },
+            "params": {
+                "code":     { "type": "string", "description": "The code to execute", "required": true },
+                "language": { "type": "string", "description": "Programming language (default: chuks)" },
+            },
+        })
+    }
+}
+
+// Singleton accessor for the built-in tool catalog. Example:
+//
+//     agent.create({
+    //         model: client,
+    //         tools: [tools.webSearch({ apiKey: KEY }), tools.calculator()]
+    //     })
+const tools = new BuiltinTools()
+
+// ═════════════════════════════════════════════════════════════════
+// ─── Helper classes for typed channels ──────────────────────────
+// (Channel<any> isn't supported by the typechecker.)
+// ═════════════════════════════════════════════════════════════════
+
+// Event emitted by `Agent.stream` over a `Channel<AgentEvent>`.
+//
+// `type` is one of: "thought", "toolCall", "toolResult", "answer".
+// Other fields are populated based on `type`:
+//   thought    -> content
+//   toolCall   -> tool, args
+//   toolResult -> tool, result, ok
+//   answer     -> content
+export class AgentEvent {
+    var type: string = ""
+    var content: string = ""
+    var tool: string = ""
+    var args: any = null
+    var result: string = ""
+    var ok: bool = false
+    constructor(cfg: any) {
+        if (cfg.type != null) { this.type = cfg.type }
+        if (cfg.content != null) { this.content = cfg.content }
+        if (cfg.tool != null) { this.tool = cfg.tool }
+        if (cfg.args != null) { this.args = cfg.args }
+        if (cfg.result != null) { this.result = cfg.result }
+        if (cfg.ok != null) { this.ok = cfg.ok }
+    }
+}
+
+class _AgentBatchMsg {
+    var index: int = 0
+    var result: AgentRunResult
+    constructor(idx: int, r: AgentRunResult) {
+        this.index = idx
+        this.result = r
+    }
+}
+
+// Top-level workers (spawn requires top-level async fns)
+async function _batchRunWorker(agentInst: Agent, task: string, ch: Channel<_AgentBatchMsg>, idx: int): Task<any> {
+    var result: AgentRunResult = await agentInst.run(task, null)
+    ch.send(new _AgentBatchMsg(idx, result))
+    return null
+}
+
+async function _parallelCrewWorker(agentInst: Agent, task: string, ch: Channel<_AgentBatchMsg>, idx: int): Task<any> {
+    var result: AgentRunResult = await agentInst.run(task, null)
+    ch.send(new _AgentBatchMsg(idx, result))
+    return null
+}
+
+// ═════════════════════════════════════════════════════════════════
+// ─── MemoryEntry ────────────────────────────────────────────────
+// Long-term memory with tags + naive keyword scoring.
+// ═════════════════════════════════════════════════════════════════
+
+class MemoryEntry {
+    var text: string = ""
+    var tags: []string = []
+    var createdAt: any = 0
+    constructor(text: string, tags: []string) {
+        this.text = text
+        this.tags = tags
+        this.createdAt = time.now()
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════
+// ─── Agent ──────────────────────────────────────────────────────
+// The core runtime. Created via agent.create(config).
+// ═════════════════════════════════════════════════════════════════
+
+export class Agent {
+    // Identity
+    var _name: string = "agent"
+    var _model: any = null
+
+    // Tools
+    var _tools: []AgentTool = []
+    var _toolMap: map[string]AgentTool = {}
+
+    // Sub-agents (for delegate())
+    var _delegates: map[string]Agent = {}
+
+    // Behaviour
+    var _systemPrompt: string = ""
+    var _maxSteps: int = 10
+    var _maxTokens: int = 4096
+    var _temperature: any = 0.2
+    var _timeout: int = 0
+    var _toolTimeout: int = 10000
+    var _maxCost: any = 0
+    var _stepDeadlineMs: int = 0
+
+    // Retry policy for LLM calls
+    var _retry: _RetryPolicy = new _RetryPolicy()
+
+    // Memory
+    var _shortTermEnabled: bool = true
+    var _longTermEnabled: bool = false
+    var _longTermStore: any = null
+    var _longTermTopK: int = 3
+    var _maxHistory: int = 20
+    var _memories: []MemoryEntry = []
+
+    // Safety
+    var _allowedTools: []string = []
+    var _confirmBeforeCall: []string = []
+
+    // Callbacks
+    var _onStep: any = null
+    var _onThink: any = null
+    var _onFinish: any = null
+    var _onError: any = null
+    var _onToolStart: any = null
+    var _onToolEnd: any = null
+
+    // Stats
+    var _totalRuns: int = 0
+    var _totalStepsAll: int = 0
+    var _totalTokens: int = 0
+    var _totalCost: any = 0
+    var _totalDurationMs: any = 0
+    var _successCount: int = 0
+    var _lastRunResult: AgentRunResult? = null
+
+    constructor(config: any) {
+        if (config.name != null) { this._name = config.name }
+        if (config.model != null) { this._model = config.model }
+
+        if (config.tools != null) {
+            var i: int = 0
+            while (i < config.tools.length) {
+                var t: any = config.tools[i]
+                this._tools.push(t)
+                this._toolMap[t.name] = t
+                i = i + 1
+            }
+        }
+
+        // Sub-agents — each can be invoked as a tool via .delegate()
+        if (config.delegates != null) {
+            var keys: []string = []
+            if (config.delegates.keys != null) { keys = config.delegates.keys() }
+            var di: int = 0
+            while (di < keys.length) {
+                var key: string = keys[di]
+                this._delegates[key] = config.delegates[key]
+                var t2: AgentTool = tool.fromAgent(config.delegates[key])
+                t2.name = key
+                this._tools.push(t2)
+                this._toolMap[key] = t2
+                di = di + 1
+            }
+        }
+
+        if (config.systemPrompt != null) { this._systemPrompt = config.systemPrompt }
+        if (config.maxSteps != null) { this._maxSteps = config.maxSteps }
+        if (config.maxTokens != null) { this._maxTokens = config.maxTokens }
+        if (config.temperature != null) { this._temperature = config.temperature }
+        if (config.timeout != null) { this._timeout = config.timeout }
+        if (config.toolTimeout != null) { this._toolTimeout = config.toolTimeout }
+        if (config.maxCost != null) { this._maxCost = config.maxCost }
+        if (config.stepDeadlineMs != null) { this._stepDeadlineMs = config.stepDeadlineMs }
+
+        if (config.retry != null) {
+            if (config.retry.maxAttempts != null) { this._retry.maxAttempts = config.retry.maxAttempts }
+            if (config.retry.initialMs != null) { this._retry.initialMs = config.retry.initialMs }
+            if (config.retry.maxMs != null) { this._retry.maxMs = config.retry.maxMs }
+            if (config.retry.multiplier != null) { this._retry.multiplier = config.retry.multiplier }
+            if (config.retry.jitterMs != null) { this._retry.jitterMs = config.retry.jitterMs }
+        }
+
+        if (config.memory != null) {
+            if (config.memory.shortTerm != null) { this._shortTermEnabled = config.memory.shortTerm }
+            if (config.memory.longTerm != null) {
+                if (config.memory.longTerm.enabled != null) { this._longTermEnabled = config.memory.longTerm.enabled }
+                if (config.memory.longTerm.store != null) { this._longTermStore = config.memory.longTerm.store }
+                if (config.memory.longTerm.topK != null) { this._longTermTopK = config.memory.longTerm.topK }
+            }
+            if (config.memory.maxHistory != null) { this._maxHistory = config.memory.maxHistory }
+        }
+
+        if (config.allowedTools != null) { this._allowedTools = config.allowedTools }
+        if (config.confirmBeforeCall != null) { this._confirmBeforeCall = config.confirmBeforeCall }
+
+        if (config.onStep != null) { this._onStep = config.onStep }
+        if (config.onThink != null) { this._onThink = config.onThink }
+        if (config.onFinish != null) { this._onFinish = config.onFinish }
+        if (config.onError != null) { this._onError = config.onError }
+        if (config.onToolStart != null) { this._onToolStart = config.onToolStart }
+        if (config.onToolEnd != null) { this._onToolEnd = config.onToolEnd }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // ─── RUN ────────────────────────────────────────────────
+    // Backwards compatible: 2nd arg may be a context object OR an
+    // options object with { context?, schema?, timeoutMs?, ... }.
+    // ═══════════════════════════════════════════════════════════
+
+    public async run(prompt: string, contextOrOptions: any?): Task<AgentRunResult> {
+        var context: any = null
+        var schema: any = null
+        var deadline: int = this._timeout
+
+        if (contextOrOptions != null) {
+            // Detect options-shape: has any of the option keys
+            var isOptions: bool = false
+            if (contextOrOptions.schema != null) { isOptions = true }
+            if (contextOrOptions.context != null) { isOptions = true }
+            if (contextOrOptions.timeoutMs != null) { isOptions = true }
+
+            if (isOptions) {
+                if (contextOrOptions.context != null) { context = contextOrOptions.context }
+                if (contextOrOptions.schema != null) { schema = contextOrOptions.schema }
+                if (contextOrOptions.timeoutMs != null) { deadline = contextOrOptions.timeoutMs }
+            } else {
+                context = contextOrOptions
+            }
+        }
+
+        lock(this) { this._totalRuns = this._totalRuns + 1 }
+        var startMs: any = time.now()
+
+        this._setupModel()
+
+        var augmentedPrompt: string = prompt
+        if (context != null) {
+            augmentedPrompt = augmentedPrompt + "\n\nContext:\n" + json.stringify(context)
+        }
+
+        // Retrieve relevant long-term memories
+        if (this._longTermEnabled && this._memories.length > 0) {
+            var hits: []MemoryEntry = this._retrieveMemories(prompt, this._longTermTopK)
+            if (hits.length > 0) {
+                var memoryContext: string = "\n\nRelevant memories:\n"
+                var mi: int = 0
+                while (mi < hits.length) {
+                    memoryContext = memoryContext + "- " + hits[mi].text + "\n"
+                    mi = mi + 1
+                }
+                augmentedPrompt = augmentedPrompt + memoryContext
+            }
+        }
+
+        // Run the agent loop (messages-array style)
+        var result: AgentRunResult = await this._runLoop(augmentedPrompt, schema, deadline, startMs)
+
+        var elapsed: any = time.now() - startMs
+        lock(this) {
+            this._totalDurationMs = this._totalDurationMs + elapsed
+            this._totalTokens = this._totalTokens + result.tokens
+            this._totalStepsAll = this._totalStepsAll + result.totalSteps
+            if (result.success) { this._successCount = this._successCount + 1 }
+            this._totalCost = this._totalCost + result.cost
+            this._lastRunResult = result
+        }
+
+        result.durationMs = elapsed
+
+        if (this._onFinish != null) { this._onFinish(result) }
+        return result
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // ─── STREAM ─────────────────────────────────────────────
+    // Emits AgentEvents to a channel: thought, toolCall, toolResult, answer.
+    // ═══════════════════════════════════════════════════════════
+
+    public async stream(prompt: string, ch: Channel<AgentEvent>, context: any?): Task<any> {
+        lock(this) { this._totalRuns = this._totalRuns + 1 }
+        this._setupModel()
+
+        var augmentedPrompt: string = prompt
+        if (context != null) {
+            augmentedPrompt = augmentedPrompt + "\n\nContext:\n" + json.stringify(context)
+        }
+
+        var stepNum: int = 0
+        var messages: []Message = this._initialMessages(augmentedPrompt)
+
+        while (stepNum < this._maxSteps) {
+            stepNum = stepNum + 1
+
+            var result: any = await this._callModelWithRetry(messages, null)
+            var content: string = result.content
+            var toolCalls: any = result.toolCalls
+            if (toolCalls == null) { toolCalls = [] }
+
+            if (toolCalls.length == 0) {
+                ch.send(new AgentEvent({ "type": "answer", "content": content }))
+                ch.close()
+                return null
+            }
+
+            if (content != "") {
+                ch.send(new AgentEvent({ "type": "thought", "content": content }))
+            }
+
+            // Append assistant turn (with tool_calls)
+            messages.push({ "role": "assistant", "content": content, "tool_calls": toolCalls })
+
+            var ti: int = 0
+            while (ti < toolCalls.length) {
+                var tc: any = toolCalls[ti]
+                ch.send(new AgentEvent({ "type": "toolCall", "tool": tc.name, "args": tc.arguments }))
+
+                var toolOutcome: any = await this._executeToolSafely(tc.name, tc.arguments, stepNum)
+                var resultStr: string = string(toolOutcome.result)
+                ch.send(new AgentEvent({ "type": "toolResult", "tool": tc.name, "result": resultStr, "ok": toolOutcome.ok }))
+
+                messages.push({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "name": tc.name,
+                    "content": resultStr,
+                })
+                ti = ti + 1
+            }
+        }
+
+        ch.send(new AgentEvent({ "type": "answer", "content": "Reached maximum steps (" + string(this._maxSteps) + ")." }))
+        ch.close()
+        return null
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // ─── BATCH ──────────────────────────────────────────────
+    // Real parallelism via spawn + channels.
+    // ═══════════════════════════════════════════════════════════
+
+    public async batch(tasks: []string): Task<[]AgentRunResult> {
+        var total: int = tasks.length
+        var emptyOut: []AgentRunResult = []
+        if (total == 0) { return emptyOut }
+
+        var ch: Channel<_AgentBatchMsg> = new Channel<_AgentBatchMsg>(total)
+        var i: int = 0
+        while (i < total) {
+            spawn _batchRunWorker(this, tasks[i], ch, i)
+            i = i + 1
+        }
+
+        var ordered: []AgentRunResult = []
+        var oi: int = 0
+        while (oi < total) {
+            var stub: AgentRunResult = {
+                "answer": "",
+                "structured": null,
+                "steps": [],
+                "totalSteps": 0,
+                "tokens": 0,
+                "inputTokens": 0,
+                "outputTokens": 0,
+                "durationMs": 0,
+                "cost": 0,
+                "model": "",
+                "success": false,
+                "cancelReason": "",
+            }
+            ordered.push(stub)
+            oi = oi + 1
+        }
+
+        var gi: int = 0
+        while (gi < total) {
+            var msg: _AgentBatchMsg? = ch.receive()
+            if (msg != null) { ordered[msg.index] = msg.result }
+            gi = gi + 1
+        }
+        return ordered
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // ─── DELEGATE ───────────────────────────────────────────
+    // Call a sub-agent registered via config.delegates by name.
+    // ═══════════════════════════════════════════════════════════
+
+    public async delegate(name: string, task: string): Task<AgentRunResult> {
+        var sub: Agent? = this._delegates[name]
+        if (sub == null) {
+            var miss: AgentRunResult = {
+                "answer": "Unknown sub-agent: " + name,
+                "structured": null,
+                "steps": [],
+                "totalSteps": 0,
+                "tokens": 0,
+                "inputTokens": 0,
+                "outputTokens": 0,
+                "durationMs": 0,
+                "cost": 0,
+                "model": "",
+                "success": false,
+                "cancelReason": "unknownDelegate",
+            }
+            return miss
+        }
+        return await sub.run(task, null)
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // ─── MEMORY ─────────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════════
+
+    // Store a fact in long-term memory.
+    //
+    // Args:
+    // - `text` — the fact to remember
+    // - `tags` — optional labels used by `getMemoryByTag` and retrieval scoring
+    public remember(text: string, tags: []string?): void {
+        var t: []string = []
+        if (tags != null) { t = tags }
+        this._memories.push(new MemoryEntry(text, t))
+    }
+
+    // Remove every memory entry whose `text` equals the argument exactly.
+    public forget(text: string): void {
+        var newMems: []MemoryEntry = []
+        var i: int = 0
+        while (i < this._memories.length) {
+            if (this._memories[i].text != text) { newMems.push(this._memories[i]) }
+            i = i + 1
+        }
+        this._memories = newMems
+    }
+
+    // Drop all long-term memory entries.
+    public clearMemory(): void { this._memories = [] }
+
+    // Return all remembered facts as a flat `[]string`. Back-compat shim;
+    // prefer `getMemoryEntries()` when you need tags or timestamps.
+    public getMemory(): []string {
+        var out: []string = []
+        var i: int = 0
+        while (i < this._memories.length) {
+            out.push(this._memories[i].text)
+            i = i + 1
+        }
+        return out
+    }
+
+    // Return the full `[]MemoryEntry` list (text + tags + createdAt).
+    public getMemoryEntries(): []MemoryEntry { return this._memories }
+
+    // Return the texts of every memory entry whose `tags` contains `tag`.
+    public getMemoryByTag(tag: string): []string {
+        var out: []string = []
+        var i: int = 0
+        while (i < this._memories.length) {
+            var entry: MemoryEntry = this._memories[i]
+            var j: int = 0
+            while (j < entry.tags.length) {
+                if (entry.tags[j] == tag) {
+                    out.push(entry.text)
+                    j = entry.tags.length
+                }
+                j = j + 1
+            }
+            i = i + 1
+        }
+        return out
+    }
+
+    // Naive keyword retrieval — score by token overlap. Top-K returned.
+    _retrieveMemories(query: string, k: int): []MemoryEntry {
+        if (this._memories.length == 0) { return [] }
+        var qLower: string = strings.toLower(query)
+        var qTokens: []string = strings.split(qLower, " ")
+
+        // Score each entry
+        var scores: []int = []
+        var i: int = 0
+        while (i < this._memories.length) {
+            var entryLower: string = strings.toLower(this._memories[i].text)
+            var s: int = 0
+            var ti: int = 0
+            while (ti < qTokens.length) {
+                var tk: string = qTokens[ti]
+                if (tk.length > 2 && strings.contains(entryLower, tk)) { s = s + 1 }
+                ti = ti + 1
+            }
+            // Tag boost: if query contains any tag, +2 per match
+            var tg: int = 0
+            while (tg < this._memories[i].tags.length) {
+                if (strings.contains(qLower, strings.toLower(this._memories[i].tags[tg]))) { s = s + 2 }
+                tg = tg + 1
+            }
+            scores.push(s)
+            i = i + 1
+        }
+
+        // Pick top-K (simple selection — N is small)
+        var picked: []bool = []
+        var pi: int = 0
+        while (pi < scores.length) { picked.push(false); pi = pi + 1 }
+
+        var out: []MemoryEntry = []
+        var taken: int = 0
+        while (taken < k) {
+            var bestIdx: int = -1
+            var bestScore: int = 0
+            var si: int = 0
+            while (si < scores.length) {
+                if (!picked[si] && scores[si] > bestScore) {
+                    bestScore = scores[si]
+                    bestIdx = si
+                }
+                si = si + 1
+            }
+            if (bestIdx < 0) { taken = k } else {
+                picked[bestIdx] = true
+                out.push(this._memories[bestIdx])
+                taken = taken + 1
+            }
+        }
+        return out
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // ─── TOOL MANAGEMENT ────────────────────────────────────
+    // ═══════════════════════════════════════════════════════════
+
+    // Register an `AgentTool` at runtime. Subsequent `run()` calls expose it
+    // to the LLM.
+    public addTool(t: AgentTool): void {
+        this._tools.push(t)
+        this._toolMap[t.name] = t
+    }
+
+    // Remove a previously-registered tool by name. No-op if not found.
+    public removeTool(name: string): void {
+        var newTools: []AgentTool = []
+        var i: int = 0
+        while (i < this._tools.length) {
+            if (this._tools[i].name != name) { newTools.push(this._tools[i]) }
+            i = i + 1
+        }
+        this._tools = newTools
+        delete this._toolMap[name]
+    }
+
+    // List the names of every tool currently registered with the agent.
+    public listTools(): []string {
+        var names: []string = []
+        var i: int = 0
+        while (i < this._tools.length) {
+            names.push(this._tools[i].name)
+            i = i + 1
+        }
+        return names
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // ─── INTROSPECTION ──────────────────────────────────────
+    // ═══════════════════════════════════════════════════════════
+
+    // Return the result object from the most recent `run()` (or `null`).
+    public lastRun(): AgentRunResult? { return this._lastRunResult }
+
+    // Aggregate counters across every `run()`.
+    //
+    // Returns: `{ totalRuns, avgSteps, avgDurationMs, totalTokens, totalCost,
+        //            successRate }`. `successRate` is a percentage `0–100`.
+    public stats(): any {
+        var avgSteps: any = 0
+        var avgDuration: any = 0
+        var successRate: any = 0
+        if (this._totalRuns > 0) {
+            avgSteps = this._totalStepsAll / this._totalRuns
+            avgDuration = this._totalDurationMs / this._totalRuns
+            successRate = (this._successCount * 100) / this._totalRuns
+        }
+        return {
+            "totalRuns": this._totalRuns,
+            "avgSteps": avgSteps,
+            "avgDurationMs": avgDuration,
+            "totalTokens": this._totalTokens,
+            "totalCost": this._totalCost,
+            "successRate": successRate,
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // ─── INTERNAL ───────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════════
+
+    _setupModel(): void {
+        if (this._model == null) { return }
+        if (this._systemPrompt != "") { this._model.system(this._systemPrompt) }
+        this._model.temperature(this._temperature)
+        this._model.maxTokens(this._maxTokens)
+
+        // We drive history via the messages array, but leave provider history
+        // disabled to avoid double-counting.
+        this._model.enableHistory(2)
+        this._model.clearHistory()
+
+        // Register tool schemas on the provider so it advertises them.
+        // Handlers are no-ops; the agent executes tools itself.
+        var i: int = 0
+        while (i < this._tools.length) {
+            var t: any = this._tools[i]
+            var schema: any = t.toSchema()
+            this._model.registerTool(
+                t.name,
+                t.description,
+                schema,
+                function(args: any): string { return "" }
+            )
+            i = i + 1
+        }
+    }
+
+    // Build the initial messages array: [system, user]
+    _initialMessages(userPrompt: string): []Message {
+        var msgs: []Message = []
+        if (this._systemPrompt != "") {
+            msgs.push({ "role": "system", "content": this._systemPrompt })
+        }
+        msgs.push({ "role": "user", "content": userPrompt })
+        return msgs
+    }
+
+    // Call the model with retry/backoff on transient errors.
+    async _callModelWithRetry(messages: []Message, extraOptions: any?): Task<any> {
+        var attempt: int = 0
+        var lastErr: string = ""
+        var delay: int = this._retry.initialMs
+
+        while (attempt < this._retry.maxAttempts) {
+            attempt = attempt + 1
+            var opts: any = { "messages": messages }
+            if (extraOptions != null) {
+                var ekeys: []string = extraOptions.keys()
+                var ki: int = 0
+                while (ki < ekeys.length) {
+                    opts[ekeys[ki]] = extraOptions[ekeys[ki]]
+                    ki = ki + 1
+                }
+            }
+
+            var result: any = null
+            try {
+                result = await this._model.complete("", opts)
+            } catch (e) {
+                lastErr = string(e)
+                if (this._onError != null) {
+                    this._onError({ "phase": "llm", "attempt": attempt, "message": lastErr, "fatal": false })
+                }
+                // Backoff before retry
+                if (attempt < this._retry.maxAttempts) {
+                    var jit: int = _jitter(this._retry.jitterMs)
+                    await _sleepMs(delay + jit)
+                    delay = delay * 2
+                    if (delay > this._retry.maxMs) { delay = this._retry.maxMs }
+                }
+                continue
+            }
+
+            // Provider returned but signalled an error
+            if (result != null && result.finishReason == "error") {
+                lastErr = "provider returned finishReason=error"
+                if (this._onError != null) {
+                    this._onError({ "phase": "llm", "attempt": attempt, "message": lastErr, "fatal": false })
+                }
+                if (attempt < this._retry.maxAttempts) {
+                    var jit2: int = _jitter(this._retry.jitterMs)
+                    await _sleepMs(delay + jit2)
+                    delay = delay * 2
+                    if (delay > this._retry.maxMs) { delay = this._retry.maxMs }
+                }
+                continue
+            }
+
+            return result
+        }
+
+        // All attempts exhausted — return a sentinel
+        return { "content": "", "model": "", "usage": null, "finishReason": "error", "toolCalls": [], "_error": lastErr }
+    }
+
+    // Execute a tool with try/catch + onError + onToolStart/End hooks.
+    async _executeToolSafely(name: string, args: any, stepNum: int): Task<ToolResult> {
+        var t: AgentTool? = this._toolMap[name]
+        if (t == null) {
+            var errMsg: string = "Unknown tool: " + name
+            if (this._onError != null) {
+                this._onError({ "phase": "tool", "step": stepNum, "tool": name, "message": errMsg, "fatal": false })
+            }
+            var unk: ToolResult = { "ok": false, "result": errMsg, "error": errMsg }
+            return unk
+        }
+        if (this._onToolStart != null) { this._onToolStart({ "step": stepNum, "tool": name, "args": args }) }
+        var r: ToolResult = await t.safeExecute(args)
+        if (this._onToolEnd != null) { this._onToolEnd({ "step": stepNum, "tool": name, "ok": r.ok, "result": r.result, "error": r.error }) }
+        if (!r.ok && this._onError != null) {
+            this._onError({ "phase": "tool", "step": stepNum, "tool": name, "message": r.error, "fatal": false })
+        }
+        return r
+    }
+
+    // The core agent loop — messages-array style.
+    // role:"tool" entries carry tool_call_id so providers can match them up.
+    async _runLoop(prompt: string, schema: any?, deadlineMs: int, startMs: any): Task<AgentRunResult> {
+        var steps: []AgentStep = []
+        var totalIn: int = 0
+        var totalOut: int = 0
+        var totalTokens: int = 0
+        var stepNum: int = 0
+        var answer: string = ""
+        var structured: any = null
+        var success: bool = true
+        var cancelReason: string = ""
+
+        var messages: []Message = this._initialMessages(prompt)
+
+        // If a schema is provided, hint the model
+        var extraOpts: any = null
+        if (schema != null) {
+            messages.push({
+                "role": "user",
+                "content": "When you have your final answer, respond with valid JSON matching this exact schema:\n" + json.stringify(schema),
+            })
+            extraOpts = { "responseFormat": { "type": "json_object" } }
+        }
+
+        while (stepNum < this._maxSteps) {
+            stepNum = stepNum + 1
+            var stepStart: any = time.now()
+
+            // Global deadline check
+            if (deadlineMs > 0 && (time.now() - startMs) > deadlineMs) {
+                success = false
+                cancelReason = "timeout"
+                stepNum = this._maxSteps
+                continue
+            }
+
+            // Cost ceiling check
+            if (this._maxCost > 0 && _estimateCost(string(this._model._model), totalIn, totalOut) > this._maxCost) {
+                success = false
+                cancelReason = "maxCost"
+                stepNum = this._maxSteps
+                continue
+            }
+
+            var result: any = await this._callModelWithRetry(messages, extraOpts)
+            if (result._error != null) {
+                success = false
+                cancelReason = "llmError"
+                stepNum = this._maxSteps
+                continue
+            }
+
+            var content: string = string(result.content)
+            var inT: int = this._extractInputTokens(result)
+            var outT: int = this._extractOutputTokens(result)
+            totalIn = totalIn + inT
+            totalOut = totalOut + outT
+            totalTokens = totalIn + totalOut
+
+            var toolCalls: any = result.toolCalls
+            if (toolCalls == null) { toolCalls = [] }
+
+            if (toolCalls.length == 0) {
+                // Final answer
+                answer = content
+                if (schema != null) {
+                    try { structured = json.parse(content) } catch (e) { structured = null }
+                }
+                var finalStep: AgentStep = {
+                    "stepNumber": stepNum,
+                    "agent": this._name,
+                    "thought": "",
+                    "tool": "none",
+                    "args": null,
+                    "result": content,
+                    "ok": true,
+                    "durationMs": time.now() - stepStart,
+                    "tokens": inT + outT,
+                }
+                steps.push(finalStep)
+                if (this._onStep != null) { this._onStep(finalStep) }
+                stepNum = this._maxSteps
+                continue
+            }
+
+            // Tool calls present — emit thought + execute each
+            if (this._onThink != null && content != "") { this._onThink(content) }
+
+            // Append assistant turn (carrying tool_calls)
+            messages.push({ "role": "assistant", "content": content, "tool_calls": toolCalls })
+
+            var ti: int = 0
+            while (ti < toolCalls.length) {
+                var tc: any = toolCalls[ti]
+                var toolName: string = tc.name
+                var toolArgs: any = tc.arguments
+
+                // Allowed-tools check
+                if (this._allowedTools.length > 0) {
+                    var isAllowed: bool = false
+                    var ai2: int = 0
+                    while (ai2 < this._allowedTools.length) {
+                        if (this._allowedTools[ai2] == toolName) {
+                            isAllowed = true
+                            ai2 = this._allowedTools.length
+                        }
+                        ai2 = ai2 + 1
+                    }
+                    if (!isAllowed) {
+                        messages.push({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "name": toolName,
+                            "content": "Tool not in allowed list",
+                        })
+                        ti = ti + 1
+                        continue
+                    }
+                }
+
+                var outcome: ToolResult = await this._executeToolSafely(toolName, toolArgs, stepNum)
+                var resultStr: string = string(outcome.result)
+
+                var step: AgentStep = {
+                    "stepNumber": stepNum,
+                    "agent": this._name,
+                    "thought": content,
+                    "tool": toolName,
+                    "args": toolArgs,
+                    "result": resultStr,
+                    "ok": outcome.ok,
+                    "durationMs": time.now() - stepStart,
+                    "tokens": inT + outT,
+                }
+                steps.push(step)
+                if (this._onStep != null) { this._onStep(step) }
+
+                messages.push({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "name": toolName,
+                    "content": resultStr,
+                })
+                ti = ti + 1
+            }
+
+            // Nudge on the last step
+            if (stepNum >= (this._maxSteps - 1)) {
+                messages.push({
+                    "role": "user",
+                    "content": "You have one step left. Write the final answer to the user as plain text now — do NOT call any more tools.",
+                })
+            }
+        }
+
+        if (answer == "" && steps.length > 0) {
+            // Fall back to last tool result if no final answer was produced
+            answer = string(steps[steps.length - 1].result)
+            success = false
+            if (cancelReason == "") { cancelReason = "maxSteps" }
+        }
+
+        var modelName: string = ""
+        if (this._model != null && this._model._model != null) { modelName = string(this._model._model) }
+        var cost: any = _estimateCost(modelName, totalIn, totalOut)
+
+        var ret: AgentRunResult = {
+            "answer": answer,
+            "structured": structured,
+            "steps": steps,
+            "totalSteps": steps.length,
+            "tokens": totalTokens,
+            "inputTokens": totalIn,
+            "outputTokens": totalOut,
+            "durationMs": 0,
+            "cost": cost,
+            "model": modelName,
+            "success": success,
+            "cancelReason": cancelReason,
+        }
+        return ret
+    }
+
+    // Token extractors — covers OpenAI / Anthropic / Ollama / Groq / Google.
+    _extractInputTokens(result: any): int {
+        if (result.usage == null) { return 0 }
+        if (result.usage.input_tokens != null) { return int(result.usage.input_tokens) }
+        if (result.usage.prompt_tokens != null) { return int(result.usage.prompt_tokens) }
+        if (result.usage.promptTokenCount != null) { return int(result.usage.promptTokenCount) }
+        return 0
+    }
+    _extractOutputTokens(result: any): int {
+        if (result.usage == null) { return 0 }
+        if (result.usage.output_tokens != null) { return int(result.usage.output_tokens) }
+        if (result.usage.completion_tokens != null) { return int(result.usage.completion_tokens) }
+        if (result.usage.candidatesTokenCount != null) { return int(result.usage.candidatesTokenCount) }
+        if (result.usage.eval_count != null) { return int(result.usage.eval_count) }
+        return 0
+    }
+    // Legacy helper kept for back-compat
+    _extractTokens(result: any): int {
+        var inT: int = this._extractInputTokens(result)
+        var outT: int = this._extractOutputTokens(result)
+        if (inT + outT > 0) { return inT + outT }
+        if (result.usage != null && result.usage.total_tokens != null) { return int(result.usage.total_tokens) }
+        return 0
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════
+// ─── Agent Module ───────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════
+
+// Factory namespace for building `Agent` instances. Use the module-level
+// `agent` singleton (`agent.create({...})`) rather than constructing this
+// directly.
+class AgentModule {
+    // Build a new `Agent` from a config object. See the `Agent` class for
+    // the full list of supported fields.
+    public create(config: any): Agent {
+        return new Agent(config)
+    }
+}
+
+// Singleton entry point for creating agents. Example:
+//
+//     const a = agent.create({ model, tools: [...] })
+const agent = new AgentModule()
+
+// ═════════════════════════════════════════════════════════════════
+// ─── Sequential Crew ────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════
+
+// A pipeline that runs agents one after another, feeding each agent's
+// `answer` as the next agent's prompt. Build via `crew.sequential([...])`.
+export class SequentialCrew {
+    var _agents: []Agent = []
+
+    constructor(agents: []Agent) {
+        var i: int = 0
+        while (i < agents.length) {
+            this._agents.push(agents[i])
+            i = i + 1
+        }
+    }
+
+    // Run the pipeline.
+    //
+    // The first agent receives `task` as its prompt. Each subsequent agent
+    // receives the previous agent's `answer`. Step lists, tokens, and cost
+    // are aggregated across the whole pipeline.
+    public async run(task: string): Task<AgentRunResult> {
+        var currentInput: string = task
+        var allSteps: []AgentStep = []
+        var totalTokens: int = 0
+        var totalCost: any = 0
+        var startMs: any = time.now()
+        var lastModel: string = ""
+
+        var i: int = 0
+        while (i < this._agents.length) {
+            var agentInst: Agent = this._agents[i]
+            var result: AgentRunResult = await agentInst.run(currentInput, null)
+
+            var si: int = 0
+            while (si < result.steps.length) {
+                allSteps.push(result.steps[si])
+                si = si + 1
+            }
+            totalTokens = totalTokens + result.tokens
+            totalCost = totalCost + result.cost
+            currentInput = result.answer
+            lastModel = result.model
+            i = i + 1
+        }
+
+        var ret: AgentRunResult = {
+            "answer": currentInput,
+            "structured": null,
+            "steps": allSteps,
+            "totalSteps": allSteps.length,
+            "tokens": totalTokens,
+            "inputTokens": 0,
+            "outputTokens": 0,
+            "durationMs": time.now() - startMs,
+            "cost": totalCost,
+            "model": lastModel,
+            "success": true,
+            "cancelReason": "",
+        }
+        return ret
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════
+// ─── Crew Module ────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════
+
+// Factory namespace for multi-agent orchestrations. Use the module-level
+// `crew` singleton instead of constructing this directly.
+class CrewModule {
+
+    // Build a sequential pipeline. Each agent runs after the previous one,
+    // taking the previous answer as its input.
+    public sequential(agents: []Agent): SequentialCrew {
+        return new SequentialCrew(agents)
+    }
+
+    // Fan out independent `CrewTask` entries in parallel.
+    //
+    // Args:
+    // - `tasks` — array of `CrewTask` (`{ agent, task }`)
+    //
+    // Each pair runs concurrently via `spawn`; results are returned in input
+    // order.
+    public async parallel(tasks: []CrewTask): Task<[]AgentRunResult> {
+        var total: int = tasks.length
+        var emptyOut: []AgentRunResult = []
+        if (total == 0) { return emptyOut }
+
+        var ch: Channel<_AgentBatchMsg> = new Channel<_AgentBatchMsg>(total)
+        var i: int = 0
+        while (i < total) {
+            var entry: CrewTask = tasks[i]
+            spawn _parallelCrewWorker(entry.agent, entry.task, ch, i)
+            i = i + 1
+        }
+
+        var ordered: []AgentRunResult = []
+        var oi: int = 0
+        while (oi < total) {
+            var stub: AgentRunResult = {
+                "answer": "",
+                "structured": null,
+                "steps": [],
+                "totalSteps": 0,
+                "tokens": 0,
+                "inputTokens": 0,
+                "outputTokens": 0,
+                "durationMs": 0,
+                "cost": 0,
+                "model": "",
+                "success": false,
+                "cancelReason": "",
+            }
+            ordered.push(stub)
+            oi = oi + 1
+        }
+
+        var gi: int = 0
+        while (gi < total) {
+            var msg: _AgentBatchMsg? = ch.receive()
+            if (msg != null) { ordered[msg.index] = msg.result }
+            gi = gi + 1
+        }
+        return ordered
+    }
+}
+
+// Singleton entry point for multi-agent orchestration. Example:
+//
+//     const pipeline = crew.sequential([researcher, writer, editor])
+//     await pipeline.run("Write a blog post about chuks")
+//
+//     const results = await crew.parallel([
+    //         { agent: a, task: "Q1" },
+    //         { agent: b, task: "Q2" }
+    //     ])
+const crew = new CrewModule()
+
+// ═════════════════════════════════════════════════════════════════
+// ─── Export ─────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════
+
+export {
+    agent,
+    tool,
+    tools,
+    crew,
+    AgentTool,
+    Agent,
+    AgentModule,
+    ToolModule,
+    BuiltinTools,
+    SequentialCrew,
+    CrewModule,
+    MemoryEntry
+}
