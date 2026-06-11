@@ -1,6 +1,6 @@
 {
   "name": "@chuks/agent",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Structured agent runtime for Chuks — production-grade AI agents with tool calling, structured concurrency, multi-agent coordination, memory, streaming, and guaranteed cancellation. No runaway LLM costs",
   "entry": "src/index.chuks",
   "author": "Chuks Team",
