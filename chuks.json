@@ -1,11 +1,11 @@
 {
   "name": "@chuks/agent",
-  "version": "1.0.3",
-  "description": "Structured agent runtime for Chuks — production-grade AI agents with tool calling, structured concurrency, multi-agent coordination, memory, streaming, and guaranteed cancellation. No runaway LLM costs",
+  "version": "1.1.1",
+  "description": "Structured agent runtime for Chuks — production-grade AI agents with tool calling, goal-convergent loops, structured concurrency, multi-agent coordination, memory, streaming, and guaranteed cancellation. No runaway LLM costs",
   "entry": "src/index.chuks",
   "author": "Chuks Team",
   "license": "MIT",
-  "keywords": ["agent", "ai", "llm", "tools", "structured-concurrency", "multi-agent", "crew", "memory", "streaming", "function-calling"],
+  "keywords": ["agent", "ai", "llm", "tools", "agent-loop", "loop-engineering", "automation", "structured-concurrency", "multi-agent", "crew", "memory", "streaming", "function-calling"],
   "repository": "https://github.com/chuks-lang/chuks_agent",
   "declaredDomains": ["api.search.brave.com", "google.serper.dev", "api.tavily.com"],
   "dependencies": {
