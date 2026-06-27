@@ -867,7 +867,11 @@ export class Agent {
         if (config.tools != null) {
             var i: int = 0
             while (i < config.tools.length) {
-                var t: any = config.tools[i]
+                var raw: any = config.tools[i]
+                // Accept both AgentTool instances and raw tool-config maps (e.g.
+                // from a connector's asTool()), wrapping the latter transparently.
+                var t: any = raw
+                if (!(raw instanceof AgentTool)) { t = new AgentTool(raw) }
                 this._tools.push(t)
                 this._toolMap[t.name] = t
                 i = i + 1
@@ -1649,20 +1653,292 @@ export class Agent {
 // ─── Agent Module ───────────────────────────────────────────────
 // ═════════════════════════════════════════════════════════════════
 
-// Factory namespace for building `Agent` instances. Use the module-level
-// `agent` singleton (`agent.create({...})`) rather than constructing this
-// directly.
-class AgentModule {
-    // Build a new `Agent` from a config object. See the `Agent` class for
-    // the full list of supported fields.
-    public create(config: any): Agent {
-        return new Agent(config)
+// ═════════════════════════════════════════════════════════════════
+// ─── Loop engineering: agent.loop() ─────────────────────────────
+//
+// The OUTER loop. Where `Agent.run()` is the inner reason→act→observe cycle,
+// `agent.loop()` is a long-lived, goal-convergent control loop around it:
+//
+//     gather context → run the agent → verify → (repeat until met) → act
+//
+// `runOnce()` is the unit an external scheduler (cron, serverless, a queue
+// consumer) runs, with state externalized — the restart-safe default. `serve()`
+// is a convenience for simple interval triggers.
+// ═════════════════════════════════════════════════════════════════
+
+// Aggregate result of one `loop.runOnce()`.
+export dataType LoopResult {
+    passed: bool          // did verification (or a single shot) succeed?
+    iterations: int       // how many gather→run→verify cycles ran
+    cost: any             // accumulated LLM cost across iterations
+    answer: string        // the last agent answer
+    stopReason: string    // "verified" | "max-iterations" | "max-cost" | "no-verify"
+    actions: []string     // which post-actions fired ("onPass" / "onFail")
+}
+
+// Persistent state for a loop, so it remembers across runs. The contract is
+// `get(key)` / `set(key, value)`; swap in a store backed by std/db or
+// chuks_redis to survive restarts. `seen`/`mark` give you cross-run dedup so a
+// scheduled loop does not re-handle the same issue or email every cycle.
+export class MemoryStateStore {
+    var _data: map[string]any = {}
+
+    public get(key: string): any { return this._data[key] }
+    public set(key: string, value: any): void { this._data[key] = value }
+    public has(key: string): bool {
+        var v: any = this._data[key]
+        return v != null
+    }
+
+    // Dedup: has this id been handled before?
+    public seen(id: string): bool { return this.has("seen:" + id) }
+    // Dedup: record an id as handled.
+    public mark(id: string): void { this._data["seen:" + id] = true }
+}
+
+// Trigger descriptors: they describe WHEN a loop should run. They carry no
+// scheduling logic of their own, keeping `runOnce()` pure and restart-safe.
+class TriggerModule {
+    public cron(expr: string): any { return { "kind": "cron", "expr": expr } }
+    public interval(ms: int): any { return { "kind": "interval", "ms": ms } }
+    public manual(): any { return { "kind": "manual" } }
+}
+
+// Verification strategies. A verify returns true when the goal is met. Prefer
+// deterministic checks (rule/state) over the LLM judge.
+class VerifyModule {
+    public rule(fn: any): any { return { "kind": "rule", "fn": fn } }
+    public state(fn: any): any { return { "kind": "state", "fn": fn } }
+    public custom(fn: any): any { return { "kind": "custom", "fn": fn } }
+    public llm(criteria: string): any { return { "kind": "llm", "criteria": criteria, "fn": null } }
+}
+
+// Post-run actions: each receives the final answer and performs a side effect.
+class ActionModule {
+    public log(prefix: string): any {
+        return { "kind": "log", "fn": function(answer: string): any {
+            println(prefix + answer)
+            return null
+        } }
+    }
+    public notify(fn: any): any { return { "kind": "notify", "fn": fn } }
+}
+
+// A long-lived, goal-convergent control loop around an agent. Built via
+// `agent.loop({...})`.
+export class AgentLoop {
+    var name: string = "loop"
+    var _model: any = null
+    var _tools: any = null
+    var _systemPrompt: string = ""
+    var _goal: string = ""
+    var _context: any = null        // fn(): Task<any> — gather fresh state
+    var _verify: any = null         // { kind, fn }
+    var _onPass: any = null         // { kind, fn }
+    var _onFail: any = null         // { kind, fn }
+    var _trigger: any = null
+    var _maxIterations: int = 3
+    var _maxCost: any = 0.0
+    var _maxStepsPerRun: int = 8
+    var _state: any = null          // optional state store (get/set) for dedup
+    var _runner: any = null         // override hook (tests): fn(prompt): Task<any>
+
+    constructor(config: any) {
+        if (config == null) { return }
+        if (config.name != null) { this.name = config.name }
+        if (config.model != null) { this._model = config.model }
+        if (config.tools != null) { this._tools = config.tools }
+        if (config.systemPrompt != null) { this._systemPrompt = config.systemPrompt }
+        if (config.goal != null) { this._goal = config.goal }
+        if (config.context != null) { this._context = config.context }
+        if (config.verify != null) { this._verify = config.verify }
+        if (config.onPass != null) { this._onPass = config.onPass }
+        if (config.onFail != null) { this._onFail = config.onFail }
+        if (config.trigger != null) { this._trigger = config.trigger }
+        if (config.maxIterations != null) { this._maxIterations = config.maxIterations }
+        if (config.maxCost != null) { this._maxCost = config.maxCost }
+        if (config.maxStepsPerRun != null) { this._maxStepsPerRun = config.maxStepsPerRun }
+        if (config.state != null) { this._state = config.state }
+        if (config._runner != null) { this._runner = config._runner }
+    }
+
+    private _num(v: any): any {
+        if (v == null) { return 0.0 }
+        return v
+    }
+
+    private _buildPrompt(ctx: any): string {
+        var p: string = this._goal
+        if (ctx != null) {
+            var serialized: string = ""
+            try { serialized = json.stringify(ctx) } catch (e) { serialized = string(ctx) }
+            if (p != "") { p = p + "\n\n" }
+            p = p + "Context:\n" + serialized
+        }
+        return p
+    }
+
+    // Run the inner agent once. With a `_runner` override (tests) it is used
+    // instead of a live agent. Returns a map: { answer, cost, success }.
+    private async _runInner(prompt: string): Task<any> {
+        if (this._runner != null) {
+            return await this._runner(prompt)
+        }
+        var a: Agent = new Agent({
+            "name": this.name,
+            "model": this._model,
+            "tools": this._tools,
+            "systemPrompt": this._systemPrompt,
+            "maxSteps": this._maxStepsPerRun
+        })
+        var rr: AgentRunResult = await a.run(prompt, null)
+        return { "answer": rr.answer, "cost": rr.cost, "success": rr.success }
+    }
+
+    private async _runVerify(): Task<bool> {
+        if (this._verify == null) { return false }
+        var fn: any = this._verify["fn"]
+        if (fn == null) { return false }
+        var ok: any = await fn()
+        if (ok == true) { return true }
+        return false
+    }
+
+    private async _runAction(action: any, answer: string): Task<any> {
+        if (action == null) { return null }
+        var fn: any = action["fn"]
+        if (fn == null) { return null }
+        await fn(answer)
+        return null
+    }
+
+    // One full convergence cycle: gather context, run the agent, verify, repeat
+    // up to `maxIterations` (or until the cost guardrail trips), then fire the
+    // matching post-action. This is the unit an external scheduler runs.
+    public async runOnce(): Task<LoopResult> {
+        var iterations: int = 0
+        var totalCost: any = 0.0
+        var lastAnswer: string = ""
+        var passed: bool = false
+        var stopReason: string = "max-iterations"
+
+        while (iterations < this._maxIterations) {
+            iterations = iterations + 1
+
+            var ctx: any = null
+            if (this._context != null) { ctx = await this._context() }
+
+            var prompt: string = this._buildPrompt(ctx)
+            var rr: any = await this._runInner(prompt)
+            lastAnswer = string(rr["answer"])
+            totalCost = totalCost + this._num(rr["cost"])
+
+            // Cost guardrail.
+            if (this._maxCost != null && this._maxCost > 0.0 && totalCost >= this._maxCost) {
+                stopReason = "max-cost"
+                break
+            }
+
+            // No verify configured → single shot; success follows the run.
+            if (this._verify == null) {
+                passed = rr["success"] == true
+                stopReason = "no-verify"
+                break
+            }
+
+            // Verify; stop as soon as the goal is met.
+            var ok: bool = await this._runVerify()
+            if (ok) {
+                passed = true
+                stopReason = "verified"
+                break
+            }
+        }
+
+        var actions: []string = []
+        if (passed) {
+            if (this._onPass != null) {
+                await this._runAction(this._onPass, lastAnswer)
+                actions.push("onPass")
+            }
+        } else {
+            if (this._onFail != null) {
+                await this._runAction(this._onFail, lastAnswer)
+                actions.push("onFail")
+            }
+        }
+
+        // Persist run bookkeeping so a scheduled loop is restart-safe and
+        // observable across cycles. Dedup state (seen/mark) is written by your
+        // own context/onPass closures against this same store.
+        if (this._state != null) {
+            var prev: any = this._state.get("runCount")
+            var n: int = 1
+            if (prev != null) { n = int(prev) + 1 }
+            this._state.set("runCount", n)
+            this._state.set("lastStopReason", stopReason)
+            this._state.set("lastPassed", passed)
+            this._state.set("lastAnswer", lastAnswer)
+        }
+
+        var result: LoopResult = {
+            "passed": passed,
+            "iterations": iterations,
+            "cost": totalCost,
+            "answer": lastAnswer,
+            "stopReason": stopReason,
+            "actions": actions,
+        }
+        return result
+    }
+
+    // The persistent state store backing this loop (or null if none was set).
+    public state(): any { return this._state }
+
+    // Convenience for interval triggers: run forever, busy-waiting `ms` between
+    // cycles. For cron or production scheduling, prefer `runOnce()` from an
+    // external scheduler with externalized state (restart-safe).
+    public async serve(): Task<any> {
+        var ms: int = 0
+        if (this._trigger != null && this._trigger["kind"] == "interval") { ms = this._trigger["ms"] }
+        while (true) {
+            await this.runOnce()
+            if (ms <= 0) { return null }
+            var start: any = time.now()
+            while ((time.now() - start) < ms) { }
+        }
+        return null
     }
 }
 
-// Singleton entry point for creating agents. Example:
+// Factory namespace for building `Agent` instances and `AgentLoop`s. Use the
+// module-level `agent` singleton rather than constructing this directly.
+class AgentModule {
+    var trigger: any = null
+    var verify: any = null
+    var action: any = null
+
+    constructor() {
+        this.trigger = new TriggerModule()
+        this.verify = new VerifyModule()
+        this.action = new ActionModule()
+    }
+
+    // Build a new `Agent` from a config object.
+    public create(config: any): Agent {
+        return new Agent(config)
+    }
+
+    // Build a goal-convergent `AgentLoop` from a config object.
+    public loop(config: any): AgentLoop {
+        return new AgentLoop(config)
+    }
+}
+
+// Singleton entry point. Examples:
 //
 //     const a = agent.create({ model, tools: [...] })
+//     const l = agent.loop({ model, goal, verify: agent.verify.rule(fn), ... })
 const agent = new AgentModule()
 
 // ═════════════════════════════════════════════════════════════════
@@ -1822,5 +2098,8 @@ export {
     BuiltinTools,
     SequentialCrew,
     CrewModule,
-    MemoryEntry
+    MemoryEntry,
+    AgentLoop,
+    LoopResult,
+    MemoryStateStore
 }

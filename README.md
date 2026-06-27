@@ -584,6 +584,100 @@ println("Support agent on :8080")
 
 ---
 
+## Loop engineering — `agent.loop()`
+
+`Agent.run()` is the **inner** loop: reason → act → observe, until the task is done. `agent.loop()` is the **outer** loop: a long-lived, goal-convergent control loop around it.
+
+```
+gather context → run the agent → verify → (repeat until met) → act
+```
+
+```chuks
+import { agent } from "pkg/@chuks/agent"
+import { ai } from "pkg/@chuks/ai"
+import { connectors, asTools } from "pkg/@chuks/connector"
+
+var github = connectors.github(githubToken, null)
+var slack  = connectors.slack(slackToken, null)
+
+var triage = agent.loop({
+    "model":   ai.openai("gpt-4o"),
+    "goal":    "Triage urgent open issues and post a summary to #dev.",
+    "tools":   asTools([github, slack]),
+    "trigger": agent.trigger.cron("0 9 * * 1-5"),       // 9am weekdays
+
+    // Gather fresh state each cycle
+    "context": function(): any {
+        return { "repo": "chuks-lang/chuks" }
+    },
+
+    // Verify with a deterministic check (preferred over an LLM judge)
+    "verify":  agent.verify.rule(function(): bool {
+        // re-query the world and decide if the goal is met
+        return true
+    }),
+
+    "onPass": agent.action.notify(function(answer: string): any {
+        return slack.send("#dev", "Morning triage complete:\n" + answer)
+    }),
+
+    "maxIterations": 3,
+    "maxCost":       0.50
+})
+
+// Run one full convergence cycle (gather → run → verify → repeat → act).
+// Call this from cron / serverless / a queue consumer; state stays external.
+var result = await triage.runOnce()
+println(result.stopReason)   // "verified" | "max-iterations" | "max-cost" | "no-verify"
+```
+
+**Anatomy**
+
+| Field | Purpose |
+| --- | --- |
+| `trigger` | When to run: `agent.trigger.cron(expr)` / `interval(ms)` / `manual()` |
+| `context` | Function gathering fresh, typed state each iteration |
+| `goal` | The objective the agent converges toward |
+| `tools` | Tools (including connector `asTool()` output) |
+| `verify` | `agent.verify.rule(fn)` / `state(fn)` / `custom(fn)` / `llm(criteria)` — returns true when met |
+| `onPass` / `onFail` | `agent.action.notify(fn)` / `log(prefix)` — fired after the cycle |
+| `maxIterations`, `maxCost` | Guardrails: stop after N cycles or once spend crosses a threshold |
+
+**Verification is the crux.** An unverified loop will confidently do the wrong thing on a schedule. Prefer deterministic checks (`rule` / `state`) that inspect real external state over the LLM judge.
+
+**Where it runs.** `runOnce()` is the restart-safe default: one convergence cycle, with all state externalized, driven by your scheduler. `serve()` is a convenience for simple `interval` triggers.
+
+**Persistent state and dedup.** A scheduled loop must remember what it already handled, or it re-sends the same Slack message and re-triages the same issue every cycle. Pass a `state` store (the built-in `MemoryStateStore`, or any object with `get`/`set` backed by `std/db` / `chuks_redis`). The loop persists run bookkeeping (`runCount`, `lastStopReason`, `lastAnswer`) into it, and you use `seen` / `mark` for cross-run dedup:
+
+```chuks
+import { agent, MemoryStateStore } from "pkg/@chuks/agent"
+
+var store = new MemoryStateStore()
+
+var triage = agent.loop({
+    "model": ai.openai("gpt-4o"),
+    "goal":  "Handle new urgent issues.",
+    "state": store,
+    "context": function(): any {
+        // skip anything already handled in a previous run
+        var fresh = []
+        for (var issue of fetchUrgentIssues()) {
+            if (!store.seen(issue.id)) { fresh.push(issue) }
+        }
+        return { "newIssues": fresh }
+    },
+    "onPass": agent.action.notify(function(answer: string): any {
+        for (var issue of lastBatch) { store.mark(issue.id) }   // never handle twice
+        return null
+    })
+})
+
+await triage.runOnce()
+println(store.get("runCount"))   // survives restarts when the store is durable
+```
+
+---
+
 ## Why chuks_agent
 
 | Feature                 | LangChain | AutoGen | CrewAI | **chuks_agent**            |
