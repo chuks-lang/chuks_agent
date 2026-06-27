@@ -69,7 +69,7 @@ The LLM is the brain. Tools are the hands. The loop runs until the model has eno
 
 | Symbol                                                    | Kind                     | Purpose                                                                 |
 | --------------------------------------------------------- | ------------------------ | ----------------------------------------------------------------------- |
-| `agent`                                                   | singleton `AgentModule`  | `agent.create({...})` builds an `Agent`.                                |
+| `agent`                                                   | singleton `AgentModule`  | `agent.create({...})` builds an `Agent`; `agent.loop({...})` builds an `AgentLoop`; `agent.trigger` / `agent.verify` / `agent.action` factories. |
 | `tool`                                                    | singleton `ToolModule`   | `tool.create({...})` and `tool.fromAgent(a)`.                           |
 | `tools`                                                   | singleton `BuiltinTools` | Built-in tool factories — `tools.webSearch(...)`, etc.                  |
 | `crew`                                                    | singleton `CrewModule`   | `crew.sequential([...])`, `crew.parallel([...])`.                       |
@@ -78,6 +78,9 @@ The LLM is the brain. Tools are the hands. The loop runs until the model has eno
 | `AgentEvent`                                              | class                    | One event emitted by `Agent.stream` over a typed channel.               |
 | `SequentialCrew`                                          | class                    | The pipeline type returned by `crew.sequential([...])`.                 |
 | `MemoryEntry`                                             | class                    | A single tagged memory entry.                                           |
+| `AgentLoop`                                               | class                    | Goal-convergent outer loop (created via `agent.loop`). `runOnce()` / `serve()`. |
+| `MemoryStateStore`                                        | class                    | Persistent state for a loop: `get`/`set`/`has` + `seen`/`mark` for cross-run dedup. |
+| `LoopResult`                                              | `dataType`               | Return shape of `AgentLoop.runOnce()`.                                   |
 | `AgentModule`, `ToolModule`, `BuiltinTools`, `CrewModule` | classes                  | The facade classes (singletons exported above; rarely needed directly). |
 | `Message`                                                 | `dataType`               | One chat-history entry.                                                 |
 | `ToolCall`                                                | `dataType`               | An LLM tool-invocation request.                                         |
