@@ -1,6 +1,6 @@
 {
   "name": "@chuks/agent",
-  "version": "1.1.2",
+  "version": "1.1.3",
   "description": "Structured agent runtime for Chuks — production-grade AI agents with tool calling, goal-convergent loops, structured concurrency, multi-agent coordination, memory, streaming, and guaranteed cancellation. No runaway LLM costs",
   "entry": "src/index.chuks",
   "author": "Chuks Team",
@@ -9,6 +9,6 @@
   "repository": "https://github.com/chuks-lang/chuks_agent",
   "declaredDomains": ["api.search.brave.com", "google.serper.dev", "api.tavily.com"],
   "dependencies": {
-    "@chuks/ai": "0.0.3"
+    "@chuks/ai": "^0.1.2"
   }
 }
